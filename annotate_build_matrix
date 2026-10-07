@@ -1,0 +1,119 @@
+cat > /tmp/run_all_kofam.sh <<'BASH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+BASE="/home/jeswes99/Desktop/Skole/Masteroppgave"
+PROTEOMES="$BASE/proteomes_downloads"
+RESULTS="$BASE/kofam_results"
+MATRIX="$BASE/ml_feature_matrix.csv"
+
+mkdir -p "$RESULTS"
+
+# Locate KOfamScan
+EXEC="$(find "$HOME" -type f -name exec_annotation -perm -111 2>/dev/null | head -n 1 || true)"
+KO_LIST="$(find "$HOME" "$BASE" -type f -name ko_list 2>/dev/null | head -n 1 || true)"
+PROFILE_DIR="$(find "$HOME" "$BASE" -type d -name profiles 2>/dev/null | head -n 1 || true)"
+
+[[ -n "$EXEC" ]] || { echo "ERROR: exec_annotation not found"; exit 1; }
+[[ -n "$KO_LIST" ]] || { echo "ERROR: ko_list not found"; exit 1; }
+[[ -n "$PROFILE_DIR" ]] || { echo "ERROR: profiles directory not found"; exit 1; }
+
+echo "exec_annotation: $EXEC"
+echo "ko_list:         $KO_LIST"
+echo "profiles:        $PROFILE_DIR"
+
+mapfile -t FASTAS < <(find "$PROTEOMES" -type f -name "protein.faa" | sort)
+
+[[ "${#FASTAS[@]}" -gt 0 ]] || {
+    echo "ERROR: no protein.faa files found"
+    exit 1
+}
+
+echo "Found ${#FASTAS[@]} proteomes."
+
+for FAA in "${FASTAS[@]}"; do
+    GENOME_DIR="$(dirname "$FAA")"
+    GENOME_ID="$(basename "$GENOME_DIR")"
+
+    # Usually this is GCF_...; include species name to avoid collisions
+    SPECIES="$(basename "$(dirname "$(dirname "$(dirname "$FAA")")")")"
+    SAMPLE="${SPECIES}__${GENOME_ID}"
+
+    OUT="$RESULTS/${SAMPLE}.tsv"
+    TMP="$RESULTS/tmp_${SAMPLE}"
+
+    if [[ -s "$OUT" ]]; then
+        echo "Skipping existing: $OUT"
+        continue
+    fi
+
+    echo "Annotating: $SAMPLE"
+    rm -rf "$TMP"
+    mkdir -p "$TMP"
+
+    "$EXEC" \
+        -p "$PROFILE_DIR" \
+        -k "$KO_LIST" \
+        --cpu 8 \
+        --tmp-dir "$TMP" \
+        -f detail-tsv \
+        -o "$OUT" \
+        "$FAA"
+
+    rm -rf "$TMP"
+done
+
+echo "Building feature matrix..."
+
+python3 - "$RESULTS" "$MATRIX" <<'PY'
+from pathlib import Path
+import pandas as pd
+import re
+import sys
+
+results = Path(sys.argv[1])
+output = Path(sys.argv[2])
+rows = []
+
+for tsv in sorted(results.glob("*.tsv")):
+    sample = tsv.stem
+    kos = set()
+
+    with tsv.open(errors="replace") as f:
+        for line in f:
+            if line.startswith("#"):
+                continue
+            match = re.search(r"\b(K\d{5})\b", line)
+            if match:
+                # In detail-tsv, the KO is the second tab-separated field.
+                fields = line.rstrip("\n").split("\t")
+                if len(fields) >= 2:
+                    ko = re.search(r"\b(K\d{5})\b", fields[1])
+                    if ko:
+                        kos.add(ko.group(1))
+
+    rows.append({"sample": sample, **{ko: 1 for ko in kos}})
+
+if not rows:
+    raise SystemExit("No annotation TSV files were found.")
+
+matrix = pd.DataFrame(rows).fillna(0)
+
+for column in matrix.columns:
+    if column != "sample":
+        matrix[column] = matrix[column].astype("int8")
+
+matrix.to_csv(output, index=False)
+
+print(f"Created: {output}")
+print(f"Samples: {len(matrix)}")
+print(f"KO features: {len(matrix.columns) - 1}")
+PY
+
+echo
+echo "DONE"
+echo "Annotation files: $RESULTS"
+echo "Feature matrix:   $MATRIX"
+BASH
+
+bash /tmp/run_all_kofam.sh
